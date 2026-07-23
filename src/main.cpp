@@ -2,8 +2,9 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
 
-const int LED_PIN = 2;
 const char* WIFI_SSID = "SYOS_IoT_2.4";
 const char* WIFI_PASSWORD = "Syos#2020";
 
@@ -16,8 +17,16 @@ const char* MQTT_CLIENT_ID = "satsmeter-device-01";
 const char* TOPIC_PUBLISH = "satsmeter/leituras";
 const char* TOPIC_SUBSCRIBE = "satsmeter/comandos";
 
+const int LED_PIN = 2;
+const int RELAY_PIN = 5;
+
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
+Adafruit_INA219 ina219;
+
+float energiaAcumulada_Wh = 0.0;
+unsigned long ultimaLeituraEnergia_ms = 0;
+bool sistemaAtivo = true;
 
 void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED)
@@ -54,6 +63,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print("Payload: ");
     Serial.println(mensagem);
     Serial.println("=======================================");
+
+    if (mensagem == "1") {
+        sistemaAtivo = true;
+        digitalWrite(RELAY_PIN, HIGH);
+        Serial.println("Sistema ligado: relé ativo, leitura retomada");
+    } else if (mensagem == "0") {
+        sistemaAtivo = false;
+        digitalWrite(RELAY_PIN, LOW);
+        Serial.println("Sistema desligado: relé cortado, leitura pausada");
+    } else {
+        Serial.println("Comando não reconhecido.");
+    }
 }
 
 void connectMQTT() {
@@ -89,6 +110,21 @@ void setup() {
     Serial.println("SATSMETER");
     Serial.println("==============================");
 
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, HIGH);
+
+    Wire.begin();
+
+    if (!ina219.begin()) {
+        Serial.println("Falha ao encontrar o INA219. Verifique a fiação!");
+        while (1) { delay(10); }
+    }
+    ina219.setCalibration_16V_400mA();
+    Serial.println("INA219 inicializado.");
+
     connectWiFi();
 
     configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
@@ -106,8 +142,7 @@ void setup() {
     mqttClient.setCallback(mqttCallback);
     mqttClient.setBufferSize(1024);
 
-    pinMode(LED_PIN, OUTPUT);  
-    digitalWrite(LED_PIN, LOW);
+    ultimaLeituraEnergia_ms = millis();
 }
 
 void loop() {
@@ -122,36 +157,41 @@ void loop() {
 
     mqttClient.loop();
 
-    if (Serial.available()) {
-        String mensagem = Serial.readStringUntil('\n');
-        mensagem.trim();
+    unsigned long agora = millis();
 
-        if (mensagem.length() > 0) {
-            if (mqttClient.publish(TOPIC_PUBLISH, mensagem.c_str())) {
-                Serial.print("Mensagem publicada: ");
-                Serial.println(mensagem);
+    if (sistemaAtivo) {
+        if (agora - ultimaLeituraEnergia_ms >= 1000) {
+            float potencia_mW = ina219.getPower_mW();
+            float deltaHoras = (agora - ultimaLeituraEnergia_ms) / 3600000.0;
+            energiaAcumulada_Wh += (potencia_mW / 1000.0) * deltaHoras;
+            ultimaLeituraEnergia_ms = agora;
+        }
+
+        static unsigned long lastPublish = 0;
+
+        if (agora - lastPublish >= 5000) {
+            lastPublish = agora;
+
+            float tensao_V = ina219.getBusVoltage_V();
+            float corrente_A = ina219.getCurrent_mA() / 1000.0;
+            float energia_kWh = energiaAcumulada_Wh / 1000.0;
+
+            String payload = "{\n";
+            payload += "  \"data_hora\":\"" + getDataHoraFormatada() + "\",\n";
+            payload += "  \"tensao_v\":" + String(tensao_V, 2) + ",\n";
+            payload += "  \"corrente_a\":" + String(corrente_A, 3) + ",\n";
+            payload += "  \"energia_kwh\":" + String(energia_kWh, 6) + "\n";
+            payload += "}";
+
+            if (mqttClient.publish(TOPIC_PUBLISH, payload.c_str())) {
+                Serial.println("Publicação periódica enviada:");
+                Serial.println(payload);
+                digitalWrite(LED_PIN, HIGH);
+                delay(100);
+                digitalWrite(LED_PIN, LOW);
             } else {
-                Serial.println("Erro ao publicar mensagem.");
+                Serial.println("Erro ao publicar mensagem periódica.");
             }
         }
-    }
-
-    static unsigned long lastPublish = 0;
-
-    if (millis() - lastPublish >= 1000) {
-        lastPublish = millis();
-
-        int leituraHall = hallRead();
-        String payload = "{\"status\":\"ok\",\"data_hora\":\"" + getDataHoraFormatada() +
-                        "\",\"hall\":" + String(leituraHall) + "}";
-
-        if (mqttClient.publish(TOPIC_PUBLISH, payload.c_str())) {
-        Serial.println("Publicação periódica enviada: " + payload);
-        digitalWrite(LED_PIN, HIGH);
-        delay(100);
-        digitalWrite(LED_PIN, LOW);
-    } else {
-        Serial.println("Erro ao publicar mensagem periódica.");
-    }
     }
 }
