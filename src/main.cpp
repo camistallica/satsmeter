@@ -20,6 +20,7 @@ const char* TOPIC_SUBSCRIBE = "satsmeter/comandos";
 const int LED_PIN = 2;
 const int RELAY_PIN = 5;
 
+
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 Adafruit_INA219 ina219;
